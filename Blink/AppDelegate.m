@@ -2,7 +2,7 @@
 //
 // B L I N K
 //
-// Copyright (C) 2016 Blink Mobile Shell Project
+// Copyright (C) 2016-2018 Blink Mobile Shell Project
 //
 // This file is part of Blink.
 //
@@ -33,6 +33,7 @@
 #import "BKiCloudSyncHandler.h"
 #import "BKTouchIDAuthManager.h"
 #import "ScreenController.h"
+
 @import CloudKit;
 
 #if HOCKEYSDK
@@ -43,10 +44,20 @@
 
 @end
 
-@implementation AppDelegate
+@implementation AppDelegate {
+  NSTimer *_suspendTimer;
+  UIBackgroundTaskIdentifier _suspendTaskId;
+  BOOL _suspendedMode;
+}
+  
+void _on_pipebroken_signal(int signum){
+  NSLog(@"PIPE is broken");
+}
 
 - (BOOL)application:(UIApplication *)application didFinishLaunchingWithOptions:(NSDictionary *)launchOptions
 {
+  signal(SIGPIPE, _on_pipebroken_signal);
+  
   [[BKTouchIDAuthManager sharedManager]registerforDeviceLockNotif];
   // Override point for customization after application launch.
 #if HOCKEYSDK
@@ -58,48 +69,21 @@
   //[[BITHockeyManager sharedHockeyManager] setDebugLogEnabled: YES];
   [[BITHockeyManager sharedHockeyManager] startManager];
   [[BITHockeyManager sharedHockeyManager].authenticator authenticateInstallation]; // This line is obsolete in the crash only build
-#endif 
-  
+#endif
+
+
   [[ScreenController shared] setup];
-
   return YES;
-}
-
-- (void)applicationWillResignActive:(UIApplication *)application
-{
-  // Sent when the application is about to move from active to inactive state. This can occur for certain types of temporary interruptions (such as an incoming phone call or SMS message) or when the user quits the application and it begins the transition to the background state.
-  // Use this method to pause ongoing tasks, disable timers, and throttle down OpenGL ES frame rates. Games should use this method to pause the game.
-}
-
-- (void)applicationDidEnterBackground:(UIApplication *)application
-{
-  // Use this method to release shared resources, save user data, invalidate timers, and store enough application state information to restore your application to its current state in case it is terminated later.
-  // If your application supports background execution, this method is called instead of applicationWillTerminate: when the user quits.
-}
-
-- (void)applicationWillEnterForeground:(UIApplication *)application
-{
-  // Called as part of the transition from the background to the inactive state; here you can undo many of the changes made on entering the background.
-}
-
-- (void)applicationDidBecomeActive:(UIApplication *)application
-{
-  // Restart any tasks that were paused (or not yet started) while the application was inactive. If the application was previously in the background, optionally refresh the user interface.
-}
-
-- (void)applicationWillTerminate:(UIApplication *)application
-{
-  // Called when the application is about to terminate. Save data if appropriate. See also applicationDidEnterBackground:.
 }
 
 - (void)application:(UIApplication *)application didReceiveRemoteNotification:(NSDictionary *)userInfo fetchCompletionHandler:(void (^)(UIBackgroundFetchResult))completionHandler {
   [[BKiCloudSyncHandler sharedHandler]checkForReachabilityAndSync:nil];
+  // TODO: pass completion handler.
 }
 
 // MARK: NSUserActivity
 
 - (BOOL)application:(UIApplication *)application willContinueUserActivityWithType:(NSString *)userActivityType {
-
   return YES;
 }
 
@@ -108,5 +92,131 @@
   restorationHandler(@[[[ScreenController shared] mainScreenRootViewController]]);
   return YES;
 }
+
+#pragma mark - State saving and restoring
+
+- (void)applicationProtectedDataWillBecomeUnavailable:(UIApplication *)application
+{
+  
+  [self _suspendApplicationOnProtectedDataWillBecomeUnavailable];
+}
+
+- (void)applicationWillTerminate:(UIApplication *)application
+{
+
+  [self _suspendApplicationOnWillTerminate];
+}
+
+- (void)applicationWillEnterForeground:(UIApplication *)application
+{
+  if (_suspendedMode) {
+    [[ScreenController shared] resume];
+  }
+
+  [self _cancelApplicationSuspend];
+}
+
+
+- (void)applicationDidEnterBackground:(UIApplication *)application
+{
+  [self _startMonitoringForSuspending];
+}
+
+- (void)_startMonitoringForSuspending
+{
+  if (_suspendedMode) {
+    return;
+  }
+  
+  NSLog(@"_startMonitoringForSuspending");
+  
+  UIApplication *application = [UIApplication sharedApplication];
+  
+  if (_suspendTaskId != UIBackgroundTaskInvalid) {
+    [application endBackgroundTask:_suspendTaskId];
+  }
+  
+  _suspendTaskId = [application beginBackgroundTaskWithName:@"Suspend" expirationHandler:^{
+    [self _suspendApplicationWithExpirationHandler];
+  }];
+  
+  NSTimeInterval time = MIN(application.backgroundTimeRemaining * 0.9, 5 * 60);
+  [_suspendTimer invalidate];
+  _suspendTimer = [NSTimer scheduledTimerWithTimeInterval:time
+                                                   target:self
+                                                 selector:@selector(_suspendApplicationWithSuspendTimer)
+                                                 userInfo:nil
+                                                  repeats:NO];
+}
+
+
+- (BOOL)application:(UIApplication *)application shouldSaveApplicationState:(nonnull NSCoder *)coder
+{
+  return YES;
+}
+
+- (BOOL)application:(UIApplication *)application shouldRestoreApplicationState:(nonnull NSCoder *)coder
+{
+  return YES;
+}
+
+- (void) application:(UIApplication *)application didDecodeRestorableStateWithCoder:(NSCoder *)coder
+{
+  [[ScreenController shared] finishRestoring];
+}
+
+- (void)_cancelApplicationSuspend
+{
+  [_suspendTimer invalidate];
+  _suspendedMode = NO;
+  if (_suspendTaskId != UIBackgroundTaskInvalid) {
+    [[UIApplication sharedApplication] endBackgroundTask:_suspendTaskId];
+  }
+  _suspendTaskId = UIBackgroundTaskInvalid;
+}
+
+// Simple wrappers to get the reason of failure from call stack
+- (void)_suspendApplicationWithSuspendTimer
+{
+  NSLog(@"_suspendApplicationWithSuspendTimer");
+  [self _suspendApplication];
+}
+
+- (void)_suspendApplicationWithExpirationHandler
+{
+  NSLog(@"_suspendApplicationWithExpirationHandler");
+  [self _suspendApplication];
+}
+
+- (void)_suspendApplicationOnWillTerminate
+{
+  NSLog(@"_suspendApplicationOnWillTerminate");
+  [self _suspendApplication];
+}
+
+- (void)_suspendApplicationOnProtectedDataWillBecomeUnavailable
+{
+  NSLog(@"_suspendApplicationOnProtectedDataWillBecomeUnavailable");
+  [self _suspendApplication];
+}
+
+- (void)_suspendApplication
+{
+  [_suspendTimer invalidate];
+  
+  if (_suspendedMode) {
+    return;
+  }
+  
+  [[ScreenController shared] suspend];
+  _suspendedMode = YES;
+  
+  if (_suspendTaskId != UIBackgroundTaskInvalid) {
+    [[UIApplication sharedApplication] endBackgroundTask:_suspendTaskId];
+  }
+  
+  _suspendTaskId = UIBackgroundTaskInvalid;
+}
+
 
 @end
